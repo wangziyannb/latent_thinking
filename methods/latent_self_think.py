@@ -16,6 +16,10 @@ class RunConfig:
     temperature: float = 0.6
     top_p: float = 0.95
 
+    latent_early_stop: bool = False
+    latent_early_stop_threshold: float = 0.8
+    latent_early_stop_probe_text: str = "Judge whether it is true or false: It's time to output. My answer is:"
+
 
 class LatentSelfThink:
     """Single-model latent thinking, reusing LatentMAS latent-step mechanism.
@@ -57,13 +61,21 @@ class LatentSelfThink:
         _, input_ids, attn = self.model.prepare_chat_input(messages, add_generation_prompt=True)
 
         past = None
+        latent_steps_used = 0
+        stop_p_true = False
+
         if self.cfg.latent_steps and self.cfg.latent_steps > 0:
+            # if self.cfg.early_stopping:
+            #     pass
             # 1) latent thinking (no decode)
-            past = self.model.generate_latent_batch(
+            past, latent_steps_used, stop_p_true = self.model.generate_latent_batch(
                 input_ids=input_ids,
                 attention_mask=attn,
                 latent_steps=self.cfg.latent_steps,
                 past_key_values=None,
+                early_stop=self.cfg.latent_early_stop,
+                early_stop_threshold=self.cfg.latent_early_stop_threshold,
+                early_stop_probe_text=self.cfg.latent_early_stop_probe_text,
             )
 
         # 2) decode final answer using the same prompt + past
@@ -94,4 +106,7 @@ class LatentSelfThink:
             "latent_steps": self.cfg.latent_steps,
             "decoded_tokens": decoded_tokens,
             "mode": "baseline" if (not self.cfg.latent_steps or self.cfg.latent_steps <= 0) else "latent",
+            "latent_steps_used": latent_steps_used,
+            "early_stopped": (latent_steps_used < self.cfg.latent_steps),
+            "early_stop_p_true": stop_p_true,
         }

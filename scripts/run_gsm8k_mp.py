@@ -78,6 +78,10 @@ def main():
     p.add_argument("--save_jsonl", type=str, default="")  # 最终合并后的 jsonl 路径（rank0 写）
     p.add_argument("--log_dir", type=str, default="logs")
 
+    p.add_argument("--latent_early_stop", action="store_true")
+    p.add_argument("--latent_early_stop_threshold", type=float, default=0.8)
+    p.add_argument("--latent_early_stop_probe_text", type=str, default="Judge whether it is true or false: Now I know how to solve this question. My answer is:")
+
     args = p.parse_args()
 
     is_ddp = ddp_setup()
@@ -96,7 +100,11 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
-        ),
+            latent_early_stop=args.latent_early_stop,
+            latent_early_stop_threshold= args.latent_early_stop_threshold,
+            latent_early_stop_probe_text = args.latent_early_stop_probe_text,
+
+    ),
     )
 
     items = load_gsm8k_sharded(args.split, args.max_samples, rank, world_size)
@@ -215,6 +223,10 @@ def main():
             "temperature": args.temperature,
             "top_p": args.top_p,
             "seed": args.seed,
+
+            "latent_early_stop": args.latent_early_stop,
+            "latent_early_stop_threshold": args.latent_early_stop_threshold,
+            "latent_early_stop_probe_text": args.latent_early_stop_probe_text,
 
             # 预测文件信息（合并后的）
             "predictions": {

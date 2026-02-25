@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -218,6 +219,9 @@ class ModelWrapper:
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
+        early_stop=False,
+        early_stop_threshold=0.8,
+        early_stop_probe_text="Judge whether it is true or false: It's time to output. My answer is:",
     ) -> Tuple:
         """Run latent-only steps and return updated past_key_values.
 
@@ -253,7 +257,15 @@ class ModelWrapper:
         past = outputs.past_key_values
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, H]
 
-        for _ in range(latent_steps):
+        if early_stop:
+            probe_ids = self.tokenizer(early_stop_probe_text, return_tensors="pt", add_special_tokens=False)[
+                "input_ids"].to(
+                self.device)
+            if probe_ids.shape[0] == 1 and input_ids.shape[0] > 1:
+                probe_ids = probe_ids.expand(input_ids.shape[0], -1)
+            true_token_ids = self._true_token_candidates()
+
+        for steps in range(latent_steps):
             latent_vec = self._apply_latent_realignment(last_hidden, self.model)
             latent_embed = latent_vec.unsqueeze(1)  # [B,1,H]
 
@@ -274,5 +286,48 @@ class ModelWrapper:
             )
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
+            if early_stop:
+                p_true = self._probe_p_true_no_pollute(past, probe_ids, true_token_ids)
+                if float(p_true[0].item()) > early_stop_threshold:
+                    return past, True, steps
+        return past, False, steps
 
-        return past
+    def _true_token_candidates(self):
+        # 只要能做到：从这些候选里找单 token 的 id
+        cands = []
+        for s in ["True", " True", "\nTrue", "\n True"]:
+            ids = self.tokenizer(s, add_special_tokens=False).input_ids
+            if len(ids) == 1:
+                cands.append(ids[0])
+        if len(cands) == 0:
+            # fallback：用 "True" 的第一个 token（保证能算 next-token prob）
+            ids = self.tokenizer("True", add_special_tokens=False).input_ids
+            cands.append(ids[0])
+        return cands
+
+    @torch.no_grad()
+    def _probe_p_true_no_pollute(self, past, probe_ids, true_token_ids):
+        # 1) 用 legacy cache 做只读输入，避免 Cache object 原地更新风险
+        probe_past = past
+        if hasattr(past, "to_legacy_cache"):
+            probe_past = past.to_legacy_cache()
+
+        B = probe_ids.shape[0]
+        past_len = _past_length(probe_past)
+        attn = torch.ones((B, past_len + probe_ids.shape[1]),
+                          dtype=torch.long, device=self.device)
+
+        out = self.model(
+            input_ids=probe_ids,
+            attention_mask=attn,
+            past_key_values=probe_past,
+            use_cache=False,  # 2) 不产生/不更新 cache（更稳）
+            return_dict=True,
+        )
+
+        logits = out.logits[:, -1, :].float()  # next token logits
+        probs = F.softmax(logits, dim=-1)
+
+        # 取 True 候选里的最大概率（更鲁棒）
+        p_true = torch.stack([probs[:, tid] for tid in true_token_ids], dim=-1).max(dim=-1).values
+        return p_true  # shape [B]
