@@ -82,6 +82,8 @@ def main():
     p.add_argument("--latent_early_stop_threshold", type=float, default=0.8)
     p.add_argument("--latent_early_stop_probe_text", type=str, default="Judge whether it is true or false: Now I know how to solve this question. My answer is:")
 
+    p.add_argument("--latent_debug_decode", action="store_true")
+
     args = p.parse_args()
 
     is_ddp = ddp_setup()
@@ -103,7 +105,7 @@ def main():
             latent_early_stop=args.latent_early_stop,
             latent_early_stop_threshold= args.latent_early_stop_threshold,
             latent_early_stop_probe_text = args.latent_early_stop_probe_text,
-
+            latent_debug_decode=args.latent_debug_decode,
     ),
     )
 

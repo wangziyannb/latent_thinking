@@ -11,12 +11,34 @@ This file is adapted from https://github.com/Gen-Verse/LatentMAS (Apache-2.0).
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+def _clone_past_key_values(past):
+    if past is None:
+        return None
+
+    # 新版 Cache 对象：转成 legacy tuple，避免原地更新
+    if hasattr(past, "to_legacy_cache"):
+        past = past.to_legacy_cache()
+
+    cloned = []
+    for layer in past:
+        # 常见格式：((k,v), (k,v), ...)
+        if isinstance(layer, (tuple, list)):
+            new_layer = []
+            for x in layer:
+                if torch.is_tensor(x):
+                    new_layer.append(x.clone())
+                else:
+                    new_layer.append(x)
+            cloned.append(tuple(new_layer))
+        else:
+            cloned.append(layer)
+    return tuple(cloned)
 
 def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
     if tokenizer.pad_token_id is None:
@@ -222,11 +244,17 @@ class ModelWrapper:
         early_stop=False,
         early_stop_threshold=0.8,
         early_stop_probe_text="Judge whether it is true or false: It's time to output. My answer is:",
+
+        debug_decode: bool = False,
+        debug_topk: int = 5,
+        debug_temperature: float = 1,
     ) -> Tuple:
         """Run latent-only steps and return updated past_key_values.
 
         Adapted from LatentMAS `generate_latent_batch`.
         """
+        debug_steps: List[Dict[str, Any]] = []
+
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
 
@@ -265,7 +293,10 @@ class ModelWrapper:
                 probe_ids = probe_ids.expand(input_ids.shape[0], -1)
             true_token_ids = self._true_token_candidates()
 
-        for steps in range(latent_steps):
+        steps_used = 0
+        stop_p_true = False
+
+        for step_idx in range(latent_steps):
             latent_vec = self._apply_latent_realignment(last_hidden, self.model)
             latent_embed = latent_vec.unsqueeze(1)  # [B,1,H]
 
@@ -286,11 +317,36 @@ class ModelWrapper:
             )
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
+            steps_used = step_idx + 1
+
+            if debug_decode:
+                logits = outputs.logits[:, -1, :].float()
+                temp = max(float(debug_temperature), 1e-6)
+                probs = F.softmax(logits / temp, dim=-1)
+
+                k = min(int(debug_topk), probs.shape[-1])
+                top_p, top_ids = torch.topk(probs, k=k, dim=-1)
+
+                batch_view = []
+                for b in range(top_ids.shape[0]):
+                    toks = [
+                        self.tokenizer.decode([tid.item()], skip_special_tokens=False)
+                        for tid in top_ids[b]
+                    ]
+                    batch_view.append(
+                        {"top_tokens": toks, "top_probs": top_p[b].tolist()}
+                    )
+
+                debug_steps.append(
+                    {"step": steps_used, "batch": batch_view}
+                )
+
             if early_stop:
                 p_true = self._probe_p_true_no_pollute(past, probe_ids, true_token_ids)
                 if float(p_true[0].item()) > early_stop_threshold:
-                    return past, True, steps
-        return past, False, steps
+                    stop_p_true = True
+                    break
+        return past, stop_p_true, steps_used, debug_steps
 
     def _true_token_candidates(self):
         # 只要能做到：从这些候选里找单 token 的 id
