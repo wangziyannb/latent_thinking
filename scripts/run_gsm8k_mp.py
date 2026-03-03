@@ -13,7 +13,7 @@ from datasets import load_dataset
 
 from models import ModelWrapper
 from methods.latent_self_think import LatentSelfThink, RunConfig
-from utils import set_seed, extract_gold_from_gsm8k_solution
+from utils import set_seed, extract_gold_from_gsm8k_solution, reserve_vram
 
 
 def ddp_setup():
@@ -67,12 +67,21 @@ def main():
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--max_samples", type=int, default=-1)  # 注意：这是“每个 rank”的上限
 
+    p.add_argument("--reserve_vram_ratio", type=float, default=0.8, help="Reserve this fraction of currently free VRAM after model loads (0~1)")
+    p.add_argument("--reserve_vram_mb", type=int, default=0, help="Reserve fixed VRAM in MB after model loads (overrides ratio if >0)")
+
+    # Qwen3 hybrid thinking switch (ignored by other models)
+    p.add_argument("--disable_thinking", action="store_true", help="Pass enable_thinking=False to chat template")
+
     p.add_argument("--latent_steps", type=int, default=40)
     p.add_argument("--latent_space_realign", action="store_true")
 
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top_p", type=float, default=0.95)
+
+    p.add_argument("--answer_only", action="store_true", help="Ask model to output only final answer")
+    p.add_argument("--loop_decode", action="store_true", help="Always do prefill->(latent)->decode loop (fairer ablation)")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save_jsonl", type=str, default="")  # 最终合并后的 jsonl 路径（rank0 写）
@@ -94,7 +103,13 @@ def main():
 
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}") if torch.cuda.is_available() else torch.device("cpu")
 
-    model = ModelWrapper(args.model_name, device, latent_space_realign=args.latent_space_realign)
+    model = ModelWrapper(
+        args.model_name,
+        device,
+        latent_space_realign=args.latent_space_realign,
+        enable_thinking=(False if args.disable_thinking else None),
+    )
+    _vram = reserve_vram(device, reserve_ratio=args.reserve_vram_ratio, reserve_mb=args.reserve_vram_mb)
     runner = LatentSelfThink(
         model,
         RunConfig(
@@ -106,6 +121,8 @@ def main():
             latent_early_stop_threshold= args.latent_early_stop_threshold,
             latent_early_stop_probe_text = args.latent_early_stop_probe_text,
             latent_debug_decode=args.latent_debug_decode,
+            answer_only=args.answer_only,
+            loop_decode=args.loop_decode,
     ),
     )
 
@@ -229,6 +246,10 @@ def main():
             "latent_early_stop": args.latent_early_stop,
             "latent_early_stop_threshold": args.latent_early_stop_threshold,
             "latent_early_stop_probe_text": args.latent_early_stop_probe_text,
+
+            "answer_only": args.answer_only,
+            "loop_decode": args.loop_decode,
+            "disable_thinking": args.disable_thinking,
 
             # 预测文件信息（合并后的）
             "predictions": {

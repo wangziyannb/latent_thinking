@@ -66,10 +66,20 @@ def _past_length(past_key_values) -> int:
     return int(k.shape[-2])
 
 class ModelWrapper:
-    def __init__(self, model_name: str, device: torch.device, *, latent_space_realign: bool = False):
+    def __init__(
+        self,
+        model_name: str,
+        device: torch.device,
+        *,
+        latent_space_realign: bool = False,
+        enable_thinking: Optional[bool] = None,
+    ):
         self.model_name = model_name
         self.device = device
         self.latent_space_realign = latent_space_realign
+        # Qwen3 chat template supports enable_thinking={True|False}.
+        # For other models / templates, this will usually be ignored.
+        self.enable_thinking = enable_thinking
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -95,7 +105,15 @@ class ModelWrapper:
     def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
-            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+            extra = {}
+            if self.enable_thinking is not None:
+                extra["enable_thinking"] = bool(self.enable_thinking)
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                **extra,
+            )
 
         # fallback generic
         segments = []

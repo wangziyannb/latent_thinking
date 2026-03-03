@@ -24,6 +24,13 @@ class RunConfig:
     latent_debug_topk: int = 5
     latent_debug_temperature: float = 1.0
 
+    # If True, ask the model to output only the final answer (no explanations).
+    answer_only: bool = False
+
+    # If True, always do a "prefill -> (optional latent steps) -> decode" loop.
+    # This makes the baseline (latent_steps=0) match the latent setting's prompt reuse.
+    loop_decode: bool = False
+
 class LatentSelfThink:
     """Single-model latent thinking, reusing LatentMAS latent-step mechanism.
 
@@ -45,11 +52,18 @@ class LatentSelfThink:
     def _build_messages(self, question: str) -> List[Dict]:
         # Close to LatentMAS judger prompt for gsm8k.
         system = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-        user = (
-            f"Target Question: {question}\n"
-            "You must reason step-by-step to solve the provided Target Question. "
-            "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
-        )
+        if self.cfg.answer_only:
+            user = (
+                f"Target Question: {question}\n"
+                "Return ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
+                "Do NOT include your reasoning steps."
+            )
+        else:
+            user = (
+                f"Target Question: {question}\n"
+                "You must reason step-by-step to solve the provided Target Question. "
+                "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
+            )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -68,14 +82,12 @@ class LatentSelfThink:
         stop_p_true = False
         debug_steps = []
 
-        if self.cfg.latent_steps and self.cfg.latent_steps > 0:
-            # if self.cfg.early_stopping:
-            #     pass
-            # 1) latent thinking (no decode)
+        if self.cfg.loop_decode or (self.cfg.latent_steps and self.cfg.latent_steps > 0):
+            # 1) prefill + (optional) latent thinking (no decode)
             past, stop_p_true, latent_steps_used, debug_steps = self.model.generate_latent_batch(
                 input_ids=input_ids,
                 attention_mask=attn,
-                latent_steps=self.cfg.latent_steps,
+                latent_steps=max(int(self.cfg.latent_steps or 0), 0),
                 past_key_values=None,
                 early_stop=self.cfg.latent_early_stop,
                 early_stop_threshold=self.cfg.latent_early_stop_threshold,
@@ -117,4 +129,5 @@ class LatentSelfThink:
             "early_stopped": (latent_steps_used < self.cfg.latent_steps),
             "early_stop_p_true": stop_p_true,
             "latent_debug_steps": debug_steps,
+            "loop_decode": self.cfg.loop_decode,
         }
