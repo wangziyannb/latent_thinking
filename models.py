@@ -309,7 +309,7 @@ class ModelWrapper:
                 self.device)
             if probe_ids.shape[0] == 1 and input_ids.shape[0] > 1:
                 probe_ids = probe_ids.expand(input_ids.shape[0], -1)
-            true_token_ids = self._true_token_candidates()
+            true_token_ids, false_token_ids = self._bool_token_candidates()
 
         steps_used = 0
         stop_p_true = False
@@ -360,27 +360,38 @@ class ModelWrapper:
                 )
 
             if early_stop:
-                p_true = self._probe_p_true_no_pollute(past, probe_ids, true_token_ids)
+                p_true = self._probe_p_true_no_pollute(
+                    past,
+                    probe_ids,
+                    true_token_ids,
+                    false_token_ids,
+                )
                 if float(p_true[0].item()) > early_stop_threshold:
                     stop_p_true = True
                     break
         return past, stop_p_true, steps_used, debug_steps
 
-    def _true_token_candidates(self):
-        # 只要能做到：从这些候选里找单 token 的 id
-        cands = []
-        for s in ["True", " True", "\nTrue", "\n True"]:
-            ids = self.tokenizer(s, add_special_tokens=False).input_ids
-            if len(ids) == 1:
-                cands.append(ids[0])
-        if len(cands) == 0:
-            # fallback：用 "True" 的第一个 token（保证能算 next-token prob）
-            ids = self.tokenizer("True", add_special_tokens=False).input_ids
-            cands.append(ids[0])
-        return cands
+    def _bool_token_candidates(self):
+        # 从多个字符串变体中选出单 token id，兼容不同 tokenizer 分词。
+        def pick_ids(variants, fallback_text):
+            cands = []
+            for s in variants:
+                ids = self.tokenizer(s, add_special_tokens=False).input_ids
+                if len(ids) == 1:
+                    cands.append(ids[0])
+            if not cands:
+                ids = self.tokenizer(fallback_text, add_special_tokens=False).input_ids
+                if ids:
+                    cands.append(ids[0])
+            # 去重并保持顺序稳定
+            return list(dict.fromkeys(cands))
+
+        true_ids = pick_ids(["True", " True", "\nTrue", "\n True"], "True")
+        false_ids = pick_ids(["False", " False", "\nFalse", "\n False"], "False")
+        return true_ids, false_ids
 
     @torch.no_grad()
-    def _probe_p_true_no_pollute(self, past, probe_ids, true_token_ids):
+    def _probe_p_true_no_pollute(self, past, probe_ids, true_token_ids, false_token_ids):
         # 1) 用 legacy cache 做只读输入，避免 Cache object 原地更新风险
         probe_past = past
         if hasattr(past, "to_legacy_cache"):
@@ -400,8 +411,10 @@ class ModelWrapper:
         )
 
         logits = out.logits[:, -1, :].float()  # next token logits
-        probs = F.softmax(logits, dim=-1)
+        true_logit = torch.stack([logits[:, tid] for tid in true_token_ids], dim=-1).max(dim=-1).values
+        false_logit = torch.stack([logits[:, tid] for tid in false_token_ids], dim=-1).max(dim=-1).values
 
-        # 取 True 候选里的最大概率（更鲁棒）
-        p_true = torch.stack([probs[:, tid] for tid in true_token_ids], dim=-1).max(dim=-1).values
+        # 在 True/False 二元上做 softmax，得到 p(True)。
+        binary_logits = torch.stack([false_logit, true_logit], dim=-1)  # [B,2], index 1 => True
+        p_true = F.softmax(binary_logits, dim=-1)[:, 1]
         return p_true  # shape [B]

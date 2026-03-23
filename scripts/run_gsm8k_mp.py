@@ -67,7 +67,7 @@ def main():
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--max_samples", type=int, default=-1)  # 注意：这是“每个 rank”的上限
 
-    p.add_argument("--reserve_vram_ratio", type=float, default=0.8, help="Reserve this fraction of currently free VRAM after model loads (0~1)")
+    p.add_argument("--reserve_vram_ratio", type=float, default=0, help="Reserve this fraction of currently free VRAM after model loads (0~1)")
     p.add_argument("--reserve_vram_mb", type=int, default=0, help="Reserve fixed VRAM in MB after model loads (overrides ratio if >0)")
 
     # Qwen3 hybrid thinking switch (ignored by other models)
@@ -92,6 +92,7 @@ def main():
     p.add_argument("--latent_early_stop_probe_text", type=str, default="Judge whether it is true or false: Now I know how to solve this question. My answer is:")
 
     p.add_argument("--latent_debug_decode", action="store_true")
+    p.add_argument("--decoding_new_message", action="store_true")
 
     args = p.parse_args()
 
@@ -123,6 +124,7 @@ def main():
             latent_debug_decode=args.latent_debug_decode,
             answer_only=args.answer_only,
             loop_decode=args.loop_decode,
+            decoding_new_message=args.decoding_new_message,
     ),
     )
 
@@ -250,6 +252,7 @@ def main():
             "answer_only": args.answer_only,
             "loop_decode": args.loop_decode,
             "disable_thinking": args.disable_thinking,
+            "decoding_new_message": args.decoding_new_message,
 
             # 预测文件信息（合并后的）
             "predictions": {

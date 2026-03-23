@@ -30,6 +30,7 @@ class RunConfig:
     # If True, always do a "prefill -> (optional latent steps) -> decode" loop.
     # This makes the baseline (latent_steps=0) match the latent setting's prompt reuse.
     loop_decode: bool = False
+    decoding_new_message: bool = False
 
 class LatentSelfThink:
     """Single-model latent thinking, reusing LatentMAS latent-step mechanism.
@@ -99,7 +100,11 @@ class LatentSelfThink:
 
         # 2) decode final answer using the same prompt + past
         #    (You can replace with a shorter prompt if desired.)
+        if self.cfg.decoding_new_message:
+            messages=[{"role": "user", "content": ("\n")}]
+
         _, dec_ids, dec_attn = self.model.prepare_chat_input(messages, add_generation_prompt=True)
+
         texts, _, per_sample_new = self.model.generate_text_batch(
             input_ids=dec_ids,
             attention_mask=dec_attn,

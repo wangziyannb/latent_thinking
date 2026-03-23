@@ -23,6 +23,51 @@ def auto_device(device: Optional[str] = None) -> torch.device:
     return torch.device("cpu")
 
 
+def reserve_vram(device: torch.device, reserve_ratio: float = 0.0, reserve_mb: int = 0, safety_mb: int = 256):
+    if reserve_ratio <= 0.0 and reserve_mb <= 0:
+        return None
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    except TypeError:
+        # older torch: mem_get_info() doesn't accept device
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+
+    safety_bytes = int(safety_mb * 1024 * 1024)
+    if free_bytes <= safety_bytes:
+        return None
+
+    if reserve_mb > 0:
+        target_bytes = int(reserve_mb * 1024 * 1024)
+    else:
+        reserve_ratio = max(0.0, min(1.0, float(reserve_ratio)))
+        target_bytes = int(free_bytes * reserve_ratio)
+
+    # Clamp so we leave some free space
+    target_bytes = min(target_bytes, max(0, free_bytes - safety_bytes))
+    if target_bytes <= 0:
+        return None
+
+    # Allocate as uint8 to match bytes
+    try:
+        buf = torch.empty((target_bytes,), dtype=torch.uint8, device=device)
+    except RuntimeError:
+        # Fall back to a smaller allocation if we were too aggressive
+        target_bytes = max(0, int((free_bytes - safety_bytes) * 0.5))
+        if target_bytes <= 0:
+            return None
+        buf = torch.empty((target_bytes,), dtype=torch.uint8, device=device)
+
+    mb = buf.numel() / (1024 * 1024)
+    # try:
+    #     free2, total2 = torch.cuda.mem_get_info(device)
+    #     print(f"[reserve_vram] reserved ~{mb:.1f} MB on {device} (free now ~{free2/(1024*1024):.1f} MB / total {total2/(1024*1024):.1f} MB)")
+    # except Exception:
+    #     print(f"[reserve_vram] reserved ~{mb:.1f} MB on {device}")
+    return buf
+
 def extract_gsm8k_answer(text: str) -> Optional[str]:
     """Extract final numeric answer.
 
