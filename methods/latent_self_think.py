@@ -6,11 +6,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from models import ModelWrapper
-from utils import extract_gsm8k_answer, normalize_answer
+from utils import answers_match, extract_answer_for_task, normalize_prediction_for_task
 
 
 @dataclass
 class RunConfig:
+    task: str = "gsm8k"
     latent_steps: int = 40
     max_new_tokens: int = 256
     temperature: float = 0.6
@@ -32,6 +33,7 @@ class RunConfig:
     loop_decode: bool = False
     decoding_new_message: bool = False
 
+
 class LatentSelfThink:
     """Single-model latent thinking, reusing LatentMAS latent-step mechanism.
 
@@ -50,21 +52,34 @@ class LatentSelfThink:
         self.model = model
         self.cfg = cfg
 
-    def _build_messages(self, question: str) -> List[Dict]:
-        # Close to LatentMAS judger prompt for gsm8k.
+    def _build_messages(self, question: str, task: str) -> List[Dict]:
         system = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-        if self.cfg.answer_only:
-            user = (
-                f"Target Question: {question}\n"
-                "Return ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
-                "Do NOT include your reasoning steps."
-            )
+        if task == "math500":
+            if self.cfg.answer_only:
+                user = (
+                    f"Math Problem: {question}\n"
+                    "Return ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
+                    "Do NOT include your reasoning steps."
+                )
+            else:
+                user = (
+                    f"Target Question: {question}\n"
+                    "You must reason step-by-step to solve the provided Target Question. "
+                    "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
+                )
         else:
-            user = (
-                f"Target Question: {question}\n"
-                "You must reason step-by-step to solve the provided Target Question. "
-                "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
-            )
+            if self.cfg.answer_only:
+                user = (
+                    f"Target Question: {question}\n"
+                    "Return ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
+                    "Do NOT include your reasoning steps."
+                )
+            else:
+                user = (
+                    f"Target Question: {question}\n"
+                    "You must reason step-by-step to solve the provided Target Question. "
+                    "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
+                )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -72,10 +87,11 @@ class LatentSelfThink:
 
     @torch.no_grad()
     def run_one(self, item: Dict) -> Dict:
+        task = item.get("task", self.cfg.task)
         question = item["question"]
         gold = item.get("gold")
 
-        messages = self._build_messages(question)
+        messages = self._build_messages(question, task)
         _, input_ids, attn = self.model.prepare_chat_input(messages, add_generation_prompt=True)
 
         past = None
@@ -101,7 +117,7 @@ class LatentSelfThink:
         # 2) decode final answer using the same prompt + past
         #    (You can replace with a shorter prompt if desired.)
         if self.cfg.decoding_new_message:
-            messages=[{"role": "user", "content": ("\n")}]
+            messages = [{"role": "user", "content": "\n"}]
 
         _, dec_ids, dec_attn = self.model.prepare_chat_input(messages, add_generation_prompt=True)
 
@@ -117,14 +133,17 @@ class LatentSelfThink:
         decoded_tokens = int(per_sample_new[0])
 
         raw = texts[0]
-        pred = normalize_answer(extract_gsm8k_answer(raw))
-        gold_n = normalize_answer(str(gold)) if gold is not None else None
-        ok = (pred == gold_n) if (pred and gold_n) else False
+        extracted = extract_answer_for_task(task, raw)
+        pred = normalize_prediction_for_task(task, extracted)
+        gold_n = normalize_prediction_for_task(task, str(gold)) if gold is not None else None
+        ok = answers_match(task, pred, gold)
 
-        return {
+        result = {
+            "task": task,
             "question": question,
             "gold": gold,
             "prediction": pred,
+            "extracted_prediction": extracted,
             "raw_prediction": raw,
             "correct": ok,
             "latent_steps": self.cfg.latent_steps,
@@ -136,3 +155,10 @@ class LatentSelfThink:
             "latent_debug_steps": debug_steps,
             "loop_decode": self.cfg.loop_decode,
         }
+        if gold_n is not None:
+            result["gold_normalized"] = gold_n
+
+        for key in ("subject", "level", "unique_id"):
+            if key in item:
+                result[key] = item[key]
+        return result

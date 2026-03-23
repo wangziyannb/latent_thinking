@@ -2,7 +2,7 @@ import argparse
 import json
 from tqdm import tqdm
 
-from data import load_gsm8k
+from data import canonical_task_name, load_task, task_label
 from models import ModelWrapper
 from methods.latent_self_think import LatentSelfThink, RunConfig
 from utils import auto_device, set_seed
@@ -11,6 +11,7 @@ from utils import auto_device, set_seed
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, required=True)
+    p.add_argument("--task", type=str, default="gsm8k")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--max_samples", type=int, default=2000)
@@ -26,6 +27,7 @@ def main():
     p.add_argument("--save_jsonl", type=str, default="")
 
     args = p.parse_args()
+    task = canonical_task_name(args.task)
 
     set_seed(args.seed)
     device = auto_device(args.device)
@@ -34,6 +36,7 @@ def main():
     runner = LatentSelfThink(
         model,
         RunConfig(
+            task=task,
             latent_steps=args.latent_steps,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
@@ -41,11 +44,11 @@ def main():
         ),
     )
 
-    items = load_gsm8k(split=args.split, max_samples=args.max_samples)
+    items = load_task(task=task, split=args.split, max_samples=args.max_samples)
 
     preds = []
     correct = 0
-    for it in tqdm(items, desc="GSM8K"):
+    for it in tqdm(items, desc=task_label(task)):
         out = runner.run_one(it)
         preds.append(out)
         correct += 1 if out.get("correct") else 0

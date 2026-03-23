@@ -3,3 +3,5 @@ transformers>=4.51.0
 datasets
 tqdm
 numpy
+sympy
+pylatexenc

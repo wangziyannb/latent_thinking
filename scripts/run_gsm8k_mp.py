@@ -3,17 +3,15 @@ import json
 import os
 import time
 import datetime
-from dataclasses import asdict
-from typing import List
 
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
-from datasets import load_dataset
 
+from data import canonical_task_name, load_task_sharded, task_label
 from models import ModelWrapper
 from methods.latent_self_think import LatentSelfThink, RunConfig
-from utils import set_seed, extract_gold_from_gsm8k_solution, reserve_vram
+from utils import set_seed, reserve_vram
 
 
 def ddp_setup():
@@ -41,29 +39,10 @@ def get_rank_world():
     return 0, 1
 
 
-def load_gsm8k_sharded(split: str, max_samples: int, rank: int, world_size: int):
-    """
-    用 datasets 的 shard 做确定性分片：
-    - 每个 rank 只拿自己那份
-    - max_samples 在分片后再截断，避免不同 rank 重叠
-    """
-    ds = load_dataset("gsm8k", "main", split=split)
-    ds = ds.shard(num_shards=world_size, index=rank, contiguous=True)
-
-    items = []
-    for ex in ds:
-        q = ex["question"]
-        sol = ex["answer"]
-        gold = extract_gold_from_gsm8k_solution(sol)
-        items.append({"question": q, "solution": sol, "gold": gold})
-        if max_samples != -1 and len(items) >= max_samples:
-            break
-    return items
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, required=True)
+    p.add_argument("--task", type=str, default="gsm8k")
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--max_samples", type=int, default=-1)  # 注意：这是“每个 rank”的上限
 
@@ -95,6 +74,7 @@ def main():
     p.add_argument("--decoding_new_message", action="store_true")
 
     args = p.parse_args()
+    task = canonical_task_name(args.task)
 
     is_ddp = ddp_setup()
     rank, world_size = get_rank_world()
@@ -114,24 +94,31 @@ def main():
     runner = LatentSelfThink(
         model,
         RunConfig(
+            task=task,
             latent_steps=args.latent_steps,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             latent_early_stop=args.latent_early_stop,
-            latent_early_stop_threshold= args.latent_early_stop_threshold,
-            latent_early_stop_probe_text = args.latent_early_stop_probe_text,
+            latent_early_stop_threshold=args.latent_early_stop_threshold,
+            latent_early_stop_probe_text=args.latent_early_stop_probe_text,
             latent_debug_decode=args.latent_debug_decode,
             answer_only=args.answer_only,
             loop_decode=args.loop_decode,
             decoding_new_message=args.decoding_new_message,
-    ),
+        ),
     )
 
-    items = load_gsm8k_sharded(args.split, args.max_samples, rank, world_size)
+    items = load_task_sharded(
+        task=task,
+        split=args.split,
+        max_samples=args.max_samples,
+        rank=rank,
+        world_size=world_size,
+    )
 
     # 只让 rank0 显示进度条更清爽
-    iterator = tqdm(items, desc=f"GSM8K rank {rank}/{world_size}", disable=(rank != 0))
+    iterator = tqdm(items, desc=f"{task_label(task)} rank {rank}/{world_size}", disable=(rank != 0))
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -210,7 +197,7 @@ def main():
             # 合并后的预测文件统一放到 log_dir
             merged_jsonl_path = os.path.join(
                 args.log_dir,
-                f"gsm8k_{run_id}_predictions.jsonl"
+                f"{task}_{run_id}_predictions.jsonl"
             )
 
             with open(merged_jsonl_path, "w", encoding="utf-8") as out_f:
@@ -230,10 +217,11 @@ def main():
 
         # 2) rank0 写 log（包含 merged_jsonl_path + 每卡统计）
         os.makedirs(args.log_dir, exist_ok=True)
-        log_path = os.path.join(args.log_dir, f"gsm8k_{run_id}.json")
+        log_path = os.path.join(args.log_dir, f"{task}_{run_id}.json")
 
         log_data = {
             "timestamp": run_id,
+            "task": task,
             "model_name": args.model_name,
             "split": args.split,
             "world_size": world_size,
