@@ -1,24 +1,20 @@
 import argparse
+import datetime
 import json
 import os
 import time
-import datetime
 
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
 from data import canonical_task_name, load_task_sharded, task_label
-from models import ModelWrapper
 from methods.latent_self_think import LatentSelfThink, RunConfig
-from utils import set_seed, reserve_vram
+from models import ModelWrapper
+from utils import reserve_vram, set_seed
 
 
 def ddp_setup():
-    """
-    torchrun 会注入这些环境变量：
-      RANK, LOCAL_RANK, WORLD_SIZE
-    """
     if "RANK" not in os.environ:
         return False
 
@@ -39,18 +35,29 @@ def get_rank_world():
     return 0, 1
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, required=True)
     p.add_argument("--task", type=str, default="gsm8k")
     p.add_argument("--split", type=str, default="test")
-    p.add_argument("--max_samples", type=int, default=-1)  # 注意：这是“每个 rank”的上限
+    p.add_argument("--max_samples", type=int, default=-1)
 
     p.add_argument("--reserve_vram_ratio", type=float, default=0, help="Reserve this fraction of currently free VRAM after model loads (0~1)")
     p.add_argument("--reserve_vram_mb", type=int, default=0, help="Reserve fixed VRAM in MB after model loads (overrides ratio if >0)")
 
-    # Qwen3 hybrid thinking switch (ignored by other models)
-    p.add_argument("--disable_thinking", action="store_true", help="Pass enable_thinking=False to chat template")
+    p.add_argument("--disable_thinking", action="store_true", help="Legacy alias that maps both phases to no_think")
+    p.add_argument("--latent_thinking_mode", type=str, default="inherit", choices=("inherit", "think", "no_think"))
+    p.add_argument("--decode_thinking_mode", type=str, default="inherit", choices=("inherit", "think", "no_think"))
+    p.add_argument("--latent_strip_think_tags", action="store_true")
+    p.add_argument("--decode_strip_think_tags", action="store_true")
+    p.add_argument("--close_latent_think_tag_before_decode", action="store_true")
+    p.add_argument("--latent_prompt_preset", type=str, default="shared", choices=("shared", "thinker"))
+    p.add_argument("--decode_prompt_preset", type=str, default="shared", choices=("shared", "actor"))
+    p.add_argument("--latent_system_prompt", type=str, default="")
+    p.add_argument("--latent_user_prompt", type=str, default="")
+    p.add_argument("--decode_system_prompt", type=str, default="")
+    p.add_argument("--decode_user_prompt", type=str, default="")
+    p.add_argument("--strategy_label", type=str, default="")
 
     p.add_argument("--latent_steps", type=int, default=40)
     p.add_argument("--latent_space_realign", action="store_true")
@@ -63,7 +70,7 @@ def main():
     p.add_argument("--loop_decode", action="store_true", help="Always do prefill->(latent)->decode loop (fairer ablation)")
 
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--save_jsonl", type=str, default="")  # 最终合并后的 jsonl 路径（rank0 写）
+    p.add_argument("--save_jsonl", type=str, default="")
     p.add_argument("--log_dir", type=str, default="logs")
 
     p.add_argument("--latent_early_stop", action="store_true")
@@ -72,14 +79,46 @@ def main():
 
     p.add_argument("--latent_debug_decode", action="store_true")
     p.add_argument("--decoding_new_message", action="store_true")
+    return p
 
-    args = p.parse_args()
+
+def build_run_config(args, task: str) -> RunConfig:
+    return RunConfig(
+        task=task,
+        latent_steps=args.latent_steps,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        latent_early_stop=args.latent_early_stop,
+        latent_early_stop_threshold=args.latent_early_stop_threshold,
+        latent_early_stop_probe_text=args.latent_early_stop_probe_text,
+        latent_debug_decode=args.latent_debug_decode,
+        answer_only=args.answer_only,
+        loop_decode=args.loop_decode,
+        decoding_new_message=args.decoding_new_message,
+        legacy_disable_thinking=args.disable_thinking,
+        strategy_label=args.strategy_label,
+        latent_thinking_mode=args.latent_thinking_mode,
+        decode_thinking_mode=args.decode_thinking_mode,
+        latent_strip_think_tags=args.latent_strip_think_tags,
+        decode_strip_think_tags=args.decode_strip_think_tags,
+        close_latent_think_tag_before_decode=args.close_latent_think_tag_before_decode,
+        latent_prompt_preset=args.latent_prompt_preset,
+        decode_prompt_preset=args.decode_prompt_preset,
+        latent_system_prompt=args.latent_system_prompt,
+        latent_user_prompt=args.latent_user_prompt,
+        decode_system_prompt=args.decode_system_prompt,
+        decode_user_prompt=args.decode_user_prompt,
+    )
+
+
+def main():
+    args = build_parser().parse_args()
     task = canonical_task_name(args.task)
 
     is_ddp = ddp_setup()
     rank, world_size = get_rank_world()
 
-    # 不同 rank 用不同 seed，避免采样完全一致（可选）
     set_seed(args.seed + rank)
 
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}") if torch.cuda.is_available() else torch.device("cpu")
@@ -88,26 +127,9 @@ def main():
         args.model_name,
         device,
         latent_space_realign=args.latent_space_realign,
-        enable_thinking=(False if args.disable_thinking else None),
     )
     _vram = reserve_vram(device, reserve_ratio=args.reserve_vram_ratio, reserve_mb=args.reserve_vram_mb)
-    runner = LatentSelfThink(
-        model,
-        RunConfig(
-            task=task,
-            latent_steps=args.latent_steps,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            latent_early_stop=args.latent_early_stop,
-            latent_early_stop_threshold=args.latent_early_stop_threshold,
-            latent_early_stop_probe_text=args.latent_early_stop_probe_text,
-            latent_debug_decode=args.latent_debug_decode,
-            answer_only=args.answer_only,
-            loop_decode=args.loop_decode,
-            decoding_new_message=args.decoding_new_message,
-        ),
-    )
+    runner = LatentSelfThink(model, build_run_config(args, task))
 
     items = load_task_sharded(
         task=task,
@@ -117,7 +139,6 @@ def main():
         world_size=world_size,
     )
 
-    # 只让 rank0 显示进度条更清爽
     iterator = tqdm(items, desc=f"{task_label(task)} rank {rank}/{world_size}", disable=(rank != 0))
 
     if torch.cuda.is_available():
@@ -135,10 +156,8 @@ def main():
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    elapsed_local = t1 - t0
+    elapsed_local = time.perf_counter() - t0
 
-    # --- 统计聚合：all_reduce 求和 ---
     correct_t = torch.tensor([correct_local], device=device, dtype=torch.long)
     count_t = torch.tensor([len(preds)], device=device, dtype=torch.long)
     decoded_t = torch.tensor([decoded_local], device=device, dtype=torch.long)
@@ -155,7 +174,6 @@ def main():
     acc = correct_total / count_total if count_total else 0.0
     elapsed_total = float(elapsed_t.item())
 
-    # --- 保存：每个 rank 先落一个临时文件，rank0 合并 ---
     tmp_path = ""
     if args.save_jsonl:
         tmp_path = f"{args.save_jsonl}.rank{rank}.tmp"
@@ -163,17 +181,15 @@ def main():
             for r in preds:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    # 每个 rank 的统计（用于写入 log）
     rank_stats = {
         "rank": rank,
         "num_samples": len(preds),
         "correct": correct_local,
         "decoded_tokens": decoded_local,
         "elapsed_s": elapsed_local,
-        "tmp_pred_path": tmp_path,  # 方便排查
+        "tmp_pred_path": tmp_path,
     }
 
-    # 收集所有 rank 的统计到 rank0
     if is_ddp:
         gathered = [None for _ in range(world_size)]
         dist.all_gather_object(gathered, rank_stats)
@@ -181,24 +197,15 @@ def main():
     else:
         all_rank_stats = [rank_stats]
 
-    # 等所有 rank 都把 tmp 写完
     if is_ddp:
         dist.barrier()
 
     merged_jsonl_path = ""
     if rank == 0:
-        # 生成 run_id（和 log 共用）
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 1) rank0 合并预测文件
         if args.save_jsonl:
-            # 创建 log_dir
             os.makedirs(args.log_dir, exist_ok=True)
-
-            # 合并后的预测文件统一放到 log_dir
-            merged_jsonl_path = os.path.join(
-                args.log_dir,
-                f"{task}_{run_id}_predictions.jsonl"
-            )
+            merged_jsonl_path = os.path.join(args.log_dir, f"{task}_{run_id}_predictions.jsonl")
 
             with open(merged_jsonl_path, "w", encoding="utf-8") as out_f:
                 for r in range(world_size):
@@ -207,7 +214,6 @@ def main():
                         with open(part, "r", encoding="utf-8") as in_f:
                             out_f.write(in_f.read())
 
-            # 清理 tmp 文件
             for r in range(world_size):
                 part = f"{args.save_jsonl}.rank{r}.tmp"
                 if os.path.exists(part):
@@ -215,7 +221,6 @@ def main():
 
             print(f"Saved predictions to: {merged_jsonl_path}")
 
-        # 2) rank0 写 log（包含 merged_jsonl_path + 每卡统计）
         os.makedirs(args.log_dir, exist_ok=True)
         log_path = os.path.join(args.log_dir, f"{task}_{run_id}.json")
 
@@ -232,22 +237,28 @@ def main():
             "temperature": args.temperature,
             "top_p": args.top_p,
             "seed": args.seed,
-
+            "strategy_label": args.strategy_label,
+            "disable_thinking": args.disable_thinking,
+            "latent_thinking_mode": args.latent_thinking_mode,
+            "decode_thinking_mode": args.decode_thinking_mode,
+            "latent_strip_think_tags": args.latent_strip_think_tags,
+            "decode_strip_think_tags": args.decode_strip_think_tags,
+            "close_latent_think_tag_before_decode": args.close_latent_think_tag_before_decode,
+            "latent_prompt_preset": args.latent_prompt_preset,
+            "decode_prompt_preset": args.decode_prompt_preset,
+            "latent_system_prompt": args.latent_system_prompt,
+            "latent_user_prompt": args.latent_user_prompt,
+            "decode_system_prompt": args.decode_system_prompt,
+            "decode_user_prompt": args.decode_user_prompt,
             "latent_early_stop": args.latent_early_stop,
             "latent_early_stop_threshold": args.latent_early_stop_threshold,
             "latent_early_stop_probe_text": args.latent_early_stop_probe_text,
-
             "answer_only": args.answer_only,
             "loop_decode": args.loop_decode,
-            "disable_thinking": args.disable_thinking,
             "decoding_new_message": args.decoding_new_message,
-
-            # 预测文件信息（合并后的）
             "predictions": {
-                "merged_jsonl_path": merged_jsonl_path
+                "merged_jsonl_path": merged_jsonl_path,
             },
-
-            # 全局指标（all_reduce 后）
             "metrics": {
                 "accuracy": acc,
                 "correct_total": correct_total,
@@ -258,18 +269,16 @@ def main():
                 "samples_per_sec": count_total / elapsed_total if elapsed_total > 0 else 0.0,
                 "tokens_per_sec": decoded_total / elapsed_total if elapsed_total > 0 else 0.0,
             },
-
-            # 每张卡的统计（gather 后）
             "ranks": all_rank_stats,
+            "resolved_phase_configs_preview": preds[0].get("phase_configs") if preds else None,
         }
 
-        # 终端仍然可以打印一份（可删）
         print(f"\nAccuracy: {acc:.4f} ({correct_total}/{count_total})")
         print(f"Total decoded tokens: {decoded_total}")
-        print(f"Avg decoded tokens/sample: {decoded_total / count_total:.2f}")
+        print(f"Avg decoded tokens/sample: {decoded_total / count_total:.2f}" if count_total else "Avg decoded tokens/sample: 0.00")
         print(f"Total inference time (wall-clock): {elapsed_total:.3f}s")
-        print(f"Samples/sec: {count_total / elapsed_total:.3f}")
-        print(f"Decoded tokens/sec: {decoded_total / elapsed_total:.3f}")
+        print(f"Samples/sec: {count_total / elapsed_total:.3f}" if elapsed_total > 0 else "Samples/sec: 0.000")
+        print(f"Decoded tokens/sec: {decoded_total / elapsed_total:.3f}" if elapsed_total > 0 else "Decoded tokens/sec: 0.000")
 
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(log_data, f, indent=2, ensure_ascii=False)

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 import torch
 
+from methods.phase_config import (
+    PhaseOptions,
+    build_messages,
+    resolve_phase_config,
+)
 from models import ModelWrapper
 from utils import answers_match, extract_answer_for_task, normalize_prediction_for_task
 
@@ -25,65 +30,89 @@ class RunConfig:
     latent_debug_topk: int = 5
     latent_debug_temperature: float = 1.0
 
-    # If True, ask the model to output only the final answer (no explanations).
     answer_only: bool = False
-
-    # If True, always do a "prefill -> (optional latent steps) -> decode" loop.
-    # This makes the baseline (latent_steps=0) match the latent setting's prompt reuse.
     loop_decode: bool = False
     decoding_new_message: bool = False
 
+    legacy_disable_thinking: bool = False
+    strategy_label: str = ""
+
+    latent_thinking_mode: str = "inherit"
+    decode_thinking_mode: str = "inherit"
+    latent_strip_think_tags: bool = False
+    decode_strip_think_tags: bool = False
+    close_latent_think_tag_before_decode: bool = False
+
+    latent_prompt_preset: str = "shared"
+    decode_prompt_preset: str = "shared"
+    latent_system_prompt: str = ""
+    latent_user_prompt: str = ""
+    decode_system_prompt: str = ""
+    decode_user_prompt: str = ""
+
+    def latent_phase_options(self) -> PhaseOptions:
+        return PhaseOptions(
+            thinking_mode=self.latent_thinking_mode,
+            strip_think_tags=self.latent_strip_think_tags,
+            prompt_preset=self.latent_prompt_preset,
+            system_prompt_override=self.latent_system_prompt,
+            user_prompt_override=self.latent_user_prompt,
+        )
+
+    def decode_phase_options(self) -> PhaseOptions:
+        return PhaseOptions(
+            thinking_mode=self.decode_thinking_mode,
+            strip_think_tags=self.decode_strip_think_tags,
+            prompt_preset=self.decode_prompt_preset,
+            system_prompt_override=self.decode_system_prompt,
+            user_prompt_override=self.decode_user_prompt,
+        )
+
 
 class LatentSelfThink:
-    """Single-model latent thinking, reusing LatentMAS latent-step mechanism.
-
-    Flow:
-    1) Build a chat prompt for GSM8K.
-    2) Run `generate_latent_batch(..., latent_steps=N)` to update KV cache without decoding.
-    3) Re-feed a short decoding prompt (same question) with `past_key_values=past` and decode.
-
-    Notes:
-    - For fairness, decoding prompt is identical to the initial prompt here.
-      You can optionally use a shorter decoding prompt (e.g. only 'Now answer:')
-      as long as you keep it consistent across baselines.
-    """
+    """Single-model latent thinking with independent latent/decode controls."""
 
     def __init__(self, model: ModelWrapper, cfg: RunConfig):
         self.model = model
         self.cfg = cfg
+        self._validate_static_config()
 
-    def _build_messages(self, question: str, task: str) -> List[Dict]:
-        system = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-        if task == "math500":
-            if self.cfg.answer_only:
-                user = (
-                    f"Math Problem: {question}\n"
-                    "Return ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
-                    "Do NOT include your reasoning steps."
-                )
-            else:
-                user = (
-                    f"Target Question: {question}\n"
-                    "You must reason step-by-step to solve the provided Target Question. "
-                    "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
-                )
-        else:
-            if self.cfg.answer_only:
-                user = (
-                    f"Target Question: {question}\n"
-                    "Return ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
-                    "Do NOT include your reasoning steps."
-                )
-            else:
-                user = (
-                    f"Target Question: {question}\n"
-                    "You must reason step-by-step to solve the provided Target Question. "
-                    "Now, reason step by step and output the final answer inside \\boxed{YOUR_FINAL_ANSWER}."
-                )
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+    def _validate_static_config(self) -> None:
+        decode_prompt_changed = any(
+            [
+                self.cfg.decode_prompt_preset != "shared",
+                bool(self.cfg.decode_system_prompt),
+                bool(self.cfg.decode_user_prompt),
+            ]
+        )
+        if self.cfg.decoding_new_message and decode_prompt_changed:
+            raise ValueError(
+                "--decoding_new_message is incompatible with decode prompt presets or overrides."
+            )
+
+    def _resolve_phase_configs(self, task: str, question: str):
+        latent_phase = resolve_phase_config(
+            phase_name="latent",
+            options=self.cfg.latent_phase_options(),
+            task=task,
+            question=question,
+            answer_only=self.cfg.answer_only,
+            legacy_disable_thinking=self.cfg.legacy_disable_thinking,
+        )
+        decode_phase = resolve_phase_config(
+            phase_name="decode",
+            options=self.cfg.decode_phase_options(),
+            task=task,
+            question=question,
+            answer_only=self.cfg.answer_only,
+            legacy_disable_thinking=self.cfg.legacy_disable_thinking,
+        )
+        return latent_phase, decode_phase
+
+    def _phase_result_payload(self, phase_cfg, messages):
+        payload = phase_cfg.to_dict()
+        payload["messages"] = messages
+        return payload
 
     @torch.no_grad()
     def run_one(self, item: Dict) -> Dict:
@@ -91,8 +120,14 @@ class LatentSelfThink:
         question = item["question"]
         gold = item.get("gold")
 
-        messages = self._build_messages(question, task)
-        _, input_ids, attn = self.model.prepare_chat_input(messages, add_generation_prompt=True)
+        latent_phase, decode_phase = self._resolve_phase_configs(task, question)
+        latent_messages = build_messages(latent_phase)
+        _, input_ids, attn = self.model.prepare_chat_input(
+            latent_messages,
+            add_generation_prompt=True,
+            enable_thinking=latent_phase.enable_thinking,
+            strip_think_tags=latent_phase.strip_think_tags,
+        )
 
         past = None
         latent_steps_used = 0
@@ -100,7 +135,6 @@ class LatentSelfThink:
         debug_steps = []
 
         if self.cfg.loop_decode or (self.cfg.latent_steps and self.cfg.latent_steps > 0):
-            # 1) prefill + (optional) latent thinking (no decode)
             past, stop_p_true, latent_steps_used, debug_steps = self.model.generate_latent_batch(
                 input_ids=input_ids,
                 attention_mask=attn,
@@ -114,12 +148,25 @@ class LatentSelfThink:
                 debug_temperature=self.cfg.latent_debug_temperature,
             )
 
-        # 2) decode final answer using the same prompt + past
-        #    (You can replace with a shorter prompt if desired.)
-        if self.cfg.decoding_new_message:
-            messages = [{"role": "user", "content": "\n"}]
+        closed_latent_think_tag = False
+        if (
+            self.cfg.close_latent_think_tag_before_decode
+            and past is not None
+            and latent_phase.enable_thinking is not False
+        ):
+            past = self.model.append_text_to_past("</think>", past)
+            closed_latent_think_tag = True
 
-        _, dec_ids, dec_attn = self.model.prepare_chat_input(messages, add_generation_prompt=True)
+        decode_messages = build_messages(decode_phase)
+        if self.cfg.decoding_new_message:
+            decode_messages = [{"role": "user", "content": "\n"}]
+
+        _, dec_ids, dec_attn = self.model.prepare_chat_input(
+            decode_messages,
+            add_generation_prompt=True,
+            enable_thinking=decode_phase.enable_thinking,
+            strip_think_tags=decode_phase.strip_think_tags,
+        )
 
         texts, _, per_sample_new = self.model.generate_text_batch(
             input_ids=dec_ids,
@@ -154,6 +201,12 @@ class LatentSelfThink:
             "early_stop_p_true": stop_p_true,
             "latent_debug_steps": debug_steps,
             "loop_decode": self.cfg.loop_decode,
+            "strategy_label": self.cfg.strategy_label,
+            "closed_latent_think_tag_before_decode": closed_latent_think_tag,
+            "phase_configs": {
+                "latent": self._phase_result_payload(latent_phase, latent_messages),
+                "decode": self._phase_result_payload(decode_phase, decode_messages),
+            },
         }
         if gold_n is not None:
             result["gold_normalized"] = gold_n

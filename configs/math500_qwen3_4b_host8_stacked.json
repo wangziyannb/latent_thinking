@@ -1,0 +1,99 @@
+{
+  "script": "scripts/run_gsm8k_mp.py",
+  "launcher": {
+    "kind": "torchrun",
+    "nproc_per_node": 4
+  },
+  "scheduler": {
+    "gpu_groups": [
+      "0,1,2,3",
+      "4,5,6,7"
+    ],
+    "jobs_per_group": 2,
+    "base_master_port": 32000
+  },
+  "base_args": {
+    "model_name": "Qwen/Qwen3-4B",
+    "task": "math500",
+    "split": "test",
+    "max_samples": 2000,
+    "latent_steps": 40,
+    "latent_space_realign": true,
+    "max_new_tokens": 32768,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "seed": 42
+  },
+  "runs": [
+    {
+      "name": "baseline_think",
+      "strategy_label": "Think",
+      "args": {
+        "latent_steps": 0,
+        "decode_thinking_mode": "think"
+      }
+    },
+    {
+      "name": "latent40_think_think",
+      "strategy_label": "Think + Think",
+      "args": {
+        "latent_thinking_mode": "think",
+        "decode_thinking_mode": "think"
+      }
+    },
+    {
+      "name": "latent40_think_no_think",
+      "strategy_label": "Think + No Think",
+      "args": {
+        "latent_thinking_mode": "think",
+        "decode_thinking_mode": "no_think"
+      }
+    },
+    {
+      "name": "latent40_no_think_think",
+      "strategy_label": "No-think + Think",
+      "args": {
+        "latent_thinking_mode": "no_think",
+        "decode_thinking_mode": "think"
+      }
+    },
+    {
+      "name": "latent40_no_think_no_think_no_tags_both",
+      "strategy_label": "No-think (no thinking tag) + No-think (no thinking tag)",
+      "args": {
+        "latent_thinking_mode": "no_think",
+        "decode_thinking_mode": "no_think",
+        "latent_strip_think_tags": true,
+        "decode_strip_think_tags": true
+      }
+    },
+    {
+      "name": "latent40_think_think_early_stop",
+      "strategy_label": "Think + Think",
+      "args": {
+        "latent_thinking_mode": "think",
+        "decode_thinking_mode": "think",
+        "latent_early_stop": true
+      }
+    },
+    {
+      "name": "latent40_thinker_actor",
+      "strategy_label": "(Thinker prompt) Think + (Actor prompt) No Think",
+      "args": {
+        "latent_thinking_mode": "think",
+        "decode_thinking_mode": "no_think",
+        "latent_prompt_preset": "thinker",
+        "decode_prompt_preset": "actor"
+      }
+    },
+    {
+      "name": "latent40_think_close_tag_no_think",
+      "strategy_label": "Think (closed think tag) + No Think",
+      "args": {
+        "latent_thinking_mode": "think",
+        "decode_thinking_mode": "no_think",
+        "close_latent_think_tag_before_decode": true
+      }
+    }
+  ]
+}

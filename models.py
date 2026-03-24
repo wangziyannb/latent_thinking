@@ -11,11 +11,16 @@ This file is adapted from https://github.com/Gen-Verse/LatentMAS (Apache-2.0).
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+_UNSET = object()
+_TAIL_THINK_TAG_RE = re.compile(r"(?:<think>\s*</think>|<think>|</think>)\s*$", re.DOTALL)
 
 def _clone_past_key_values(past):
     if past is None:
@@ -48,6 +53,24 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
 
+def _strip_assistant_tail_think_tags(text: str) -> str:
+    if not text:
+        return text
+
+    stripped = text.rstrip()
+    tail = stripped[-128:]
+    if "<think>" not in tail and "</think>" not in tail:
+        return text
+
+    while True:
+        updated = _TAIL_THINK_TAG_RE.sub("", stripped).rstrip()
+        if updated == stripped:
+            break
+        stripped = updated
+
+    return stripped + text[len(text.rstrip()):]
+
+
 def _past_length(past_key_values) -> int:
     if past_key_values is None:
         return 0
@@ -64,6 +87,21 @@ def _past_length(past_key_values) -> int:
     # Legacy tuple format: ((k,v), (k,v), ...)
     k = past_key_values[0][0]
     return int(k.shape[-2])
+
+
+def _past_batch_size(past_key_values) -> Optional[int]:
+    if past_key_values is None:
+        return None
+
+    if hasattr(past_key_values, "to_legacy_cache"):
+        past_key_values = past_key_values.to_legacy_cache()
+
+    first_layer = past_key_values[0]
+    if isinstance(first_layer, (tuple, list)):
+        for value in first_layer:
+            if torch.is_tensor(value):
+                return int(value.shape[0])
+    return None
 
 class ModelWrapper:
     def __init__(
@@ -102,18 +140,29 @@ class ModelWrapper:
             self._ensure_latent_realign_matrix(self.model, self.device)
 
     # ---------- prompt helpers ----------
-    def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
+    def render_chat(
+        self,
+        messages: List[Dict],
+        add_generation_prompt: bool = True,
+        *,
+        enable_thinking=_UNSET,
+        strip_think_tags: bool = False,
+    ) -> str:
+        thinking_value = self.enable_thinking if enable_thinking is _UNSET else enable_thinking
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
             extra = {}
-            if self.enable_thinking is not None:
-                extra["enable_thinking"] = bool(self.enable_thinking)
-            return self.tokenizer.apply_chat_template(
+            if thinking_value is not None:
+                extra["enable_thinking"] = bool(thinking_value)
+            prompt_text = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
                 **extra,
             )
+            if strip_think_tags:
+                prompt_text = _strip_assistant_tail_think_tags(prompt_text)
+            return prompt_text
 
         # fallback generic
         segments = []
@@ -123,14 +172,60 @@ class ModelWrapper:
             segments.append(f"<|{role}|>\n{content}\n</|{role}|>")
         if add_generation_prompt:
             segments.append("<|assistant|>")
-        return "\n".join(segments)
+        prompt_text = "\n".join(segments)
+        if strip_think_tags:
+            prompt_text = _strip_assistant_tail_think_tags(prompt_text)
+        return prompt_text
 
-    def prepare_chat_input(self, messages: List[Dict], add_generation_prompt: bool = True):
-        prompt_text = self.render_chat(messages, add_generation_prompt=add_generation_prompt)
+    def prepare_chat_input(
+        self,
+        messages: List[Dict],
+        add_generation_prompt: bool = True,
+        *,
+        enable_thinking=_UNSET,
+        strip_think_tags: bool = False,
+    ):
+        prompt_text = self.render_chat(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            strip_think_tags=strip_think_tags,
+        )
         encoded = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         return prompt_text, input_ids, attention_mask
+
+    @torch.no_grad()
+    def append_text_to_past(self, text: str, past_key_values: Optional[Tuple]) -> Optional[Tuple]:
+        if not text:
+            return past_key_values
+
+        encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        input_ids = encoded["input_ids"].to(self.device)
+        batch_size = _past_batch_size(past_key_values)
+        if batch_size is not None and input_ids.shape[0] == 1 and batch_size > 1:
+            input_ids = input_ids.expand(batch_size, -1)
+
+        attention_mask = torch.ones_like(input_ids, device=self.device)
+        if past_key_values is not None:
+            past_len = _past_length(past_key_values)
+            if past_len > 0:
+                past_mask = torch.ones(
+                    (attention_mask.shape[0], past_len),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        return outputs.past_key_values
 
     # ---------- latent alignment (from LatentMAS) ----------
     def _build_latent_realign_matrix(self, model, device) -> Tuple[torch.Tensor, torch.Tensor]:
