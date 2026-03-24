@@ -12,7 +12,7 @@
     "batch_size": 4,
     "latent_steps": 40,
     "latent_space_realign": true,
-    "max_new_tokens": 32768,
+    "max_new_tokens": 10000,
     "temperature": 0.6,
     "top_p": 0.95,
     "seed": 42,
