@@ -5,3 +5,4 @@ tqdm
 numpy
 sympy
 pylatexenc
+matplotlib
