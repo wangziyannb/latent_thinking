@@ -2,11 +2,18 @@ import argparse
 import datetime
 import json
 import os
+import sys
 import time
+from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from data import canonical_task_name, load_task_sharded, task_label
 from methods.latent_self_think import LatentSelfThink, RunConfig
@@ -14,11 +21,18 @@ from models import ModelWrapper
 from utils import reserve_vram, set_seed
 
 
-def ddp_setup():
+def ddp_setup(args):
     if "RANK" not in os.environ:
         return False
 
-    dist.init_process_group(backend="nccl")
+    if args.nccl_p2p_disable:
+        os.environ["NCCL_P2P_DISABLE"] = "1"
+
+    init_kwargs = {"backend": "nccl"}
+    if args.ddp_timeout_minutes and args.ddp_timeout_minutes > 0:
+        init_kwargs["timeout"] = timedelta(minutes=int(args.ddp_timeout_minutes))
+
+    dist.init_process_group(**init_kwargs)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return True
@@ -35,15 +49,27 @@ def get_rank_world():
     return 0, 1
 
 
+def _effective_batch_size(args) -> int:
+    requested = max(int(args.batch_size or 1), 1)
+    if args.latent_early_stop:
+        return 1
+    return requested
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, required=True)
     p.add_argument("--task", type=str, default="gsm8k")
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--max_samples", type=int, default=-1)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--attn_implementation", type=str, default="auto", choices=("auto", "eager", "sdpa", "flash_attention_2"))
+    p.add_argument("--disable_cudnn_sdp", action="store_true")
 
     p.add_argument("--reserve_vram_ratio", type=float, default=0, help="Reserve this fraction of currently free VRAM after model loads (0~1)")
     p.add_argument("--reserve_vram_mb", type=int, default=0, help="Reserve fixed VRAM in MB after model loads (overrides ratio if >0)")
+    p.add_argument("--nccl_p2p_disable", action="store_true", help="Set NCCL_P2P_DISABLE=1 before init_process_group")
+    p.add_argument("--ddp_timeout_minutes", type=int, default=0, help="Override init_process_group timeout in minutes")
 
     p.add_argument("--disable_thinking", action="store_true", help="Legacy alias that maps both phases to no_think")
     p.add_argument("--latent_thinking_mode", type=str, default="inherit", choices=("inherit", "think", "no_think"))
@@ -116,7 +142,7 @@ def main():
     args = build_parser().parse_args()
     task = canonical_task_name(args.task)
 
-    is_ddp = ddp_setup()
+    is_ddp = ddp_setup(args)
     rank, world_size = get_rank_world()
 
     set_seed(args.seed + rank)
@@ -127,6 +153,8 @@ def main():
         args.model_name,
         device,
         latent_space_realign=args.latent_space_realign,
+        attn_implementation=args.attn_implementation,
+        disable_cudnn_sdp=args.disable_cudnn_sdp,
     )
     _vram = reserve_vram(device, reserve_ratio=args.reserve_vram_ratio, reserve_mb=args.reserve_vram_mb)
     runner = LatentSelfThink(model, build_run_config(args, task))
@@ -139,7 +167,15 @@ def main():
         world_size=world_size,
     )
 
-    iterator = tqdm(items, desc=f"{task_label(task)} rank {rank}/{world_size}", disable=(rank != 0))
+    effective_batch_size = _effective_batch_size(args)
+    if rank == 0 and args.latent_early_stop and args.batch_size > 1:
+        print("latent_early_stop is enabled; forcing batch_size=1 for correctness.")
+
+    progress = tqdm(
+        total=len(items),
+        desc=f"{task_label(task)} rank {rank}/{world_size}",
+        disable=(rank != 0),
+    )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -148,11 +184,16 @@ def main():
     preds = []
     correct_local = 0
     decoded_local = 0
-    for it in iterator:
-        out = runner.run_one(it)
-        preds.append(out)
-        correct_local += 1 if out.get("correct") else 0
-        decoded_local += int(out.get("decoded_tokens", 0))
+    for start in range(0, len(items), effective_batch_size):
+        batch_items = items[start:start + effective_batch_size]
+        outs = runner.run_batch(batch_items)
+        preds.extend(outs)
+        for out in outs:
+            correct_local += 1 if out.get("correct") else 0
+            decoded_local += int(out.get("decoded_tokens", 0))
+        progress.update(len(batch_items))
+
+    progress.close()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -231,6 +272,10 @@ def main():
             "split": args.split,
             "world_size": world_size,
             "max_samples_per_rank": args.max_samples,
+            "batch_size_requested": args.batch_size,
+            "batch_size_effective": effective_batch_size,
+            "attn_implementation": args.attn_implementation,
+            "disable_cudnn_sdp": args.disable_cudnn_sdp,
             "latent_steps": args.latent_steps,
             "latent_space_realign": args.latent_space_realign,
             "max_new_tokens": args.max_new_tokens,
@@ -238,6 +283,8 @@ def main():
             "top_p": args.top_p,
             "seed": args.seed,
             "strategy_label": args.strategy_label,
+            "nccl_p2p_disable": args.nccl_p2p_disable,
+            "ddp_timeout_minutes": args.ddp_timeout_minutes,
             "disable_thinking": args.disable_thinking,
             "latent_thinking_mode": args.latent_thinking_mode,
             "decode_thinking_mode": args.decode_thinking_mode,

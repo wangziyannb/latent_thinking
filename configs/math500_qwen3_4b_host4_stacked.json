@@ -8,7 +8,7 @@
     "gpu_groups": [
       "0,1,2,3"
     ],
-    "jobs_per_group": 2,
+    "jobs_per_group": 1,
     "base_master_port": 31000
   },
   "base_args": {
@@ -16,12 +16,16 @@
     "task": "math500",
     "split": "test",
     "max_samples": 2000,
+    "batch_size": 4,
     "latent_steps": 40,
     "latent_space_realign": true,
-    "max_new_tokens": 32768,
+    "max_new_tokens": 10000,
     "temperature": 0.6,
     "top_p": 0.95,
-    "seed": 42
+    "seed": 42,
+    "disable_cudnn_sdp": true,
+    "nccl_p2p_disable": true,
+    "ddp_timeout_minutes": 120
   },
   "runs": [
     {

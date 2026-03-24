@@ -27,7 +27,7 @@ def load_matrix_config(path: str) -> Dict:
 
 
 def _cli_flag(key: str) -> str:
-    return "--" + key.replace("_", "-")
+    return "--" + key
 
 
 def _build_cli_args(args: Dict) -> List[str]:

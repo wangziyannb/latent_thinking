@@ -111,6 +111,8 @@ class ModelWrapper:
         *,
         latent_space_realign: bool = False,
         enable_thinking: Optional[bool] = None,
+        attn_implementation: str = "auto",
+        disable_cudnn_sdp: bool = False,
     ):
         self.model_name = model_name
         self.device = device
@@ -121,13 +123,20 @@ class ModelWrapper:
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.tokenizer.padding_side = "left"
         _ensure_pad_token(self.tokenizer)
 
+        if disable_cudnn_sdp and torch.cuda.is_available() and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
+
+        model_kwargs = {
+            "dtype": (torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+        }
+        if attn_implementation and attn_implementation != "auto":
+            model_kwargs["attn_implementation"] = attn_implementation
+
         with torch.no_grad():
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
-            )
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
 
@@ -195,6 +204,36 @@ class ModelWrapper:
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         return prompt_text, input_ids, attention_mask
+
+    def prepare_chat_batch(
+        self,
+        batch_messages: List[List[Dict]],
+        add_generation_prompt: bool = True,
+        *,
+        enable_thinking=_UNSET,
+        strip_think_tags: bool = False,
+    ):
+        if not batch_messages:
+            raise ValueError("batch_messages must be non-empty.")
+
+        prompt_texts = [
+            self.render_chat(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+                strip_think_tags=strip_think_tags,
+            )
+            for messages in batch_messages
+        ]
+        encoded = self.tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            add_special_tokens=False,
+            padding=True,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
+        return prompt_texts, input_ids, attention_mask
 
     @torch.no_grad()
     def append_text_to_past(self, text: str, past_key_values: Optional[Tuple]) -> Optional[Tuple]:

@@ -9,12 +9,16 @@
     "task": "math500",
     "split": "test",
     "max_samples": 2000,
+    "batch_size": 4,
     "latent_steps": 40,
     "latent_space_realign": true,
     "max_new_tokens": 32768,
     "temperature": 0.6,
     "top_p": 0.95,
-    "seed": 42
+    "seed": 42,
+    "disable_cudnn_sdp": true,
+    "nccl_p2p_disable": true,
+    "ddp_timeout_minutes": 120
   },
   "runs": [
     {

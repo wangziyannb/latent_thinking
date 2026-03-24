@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List
 
 import torch
 
@@ -114,27 +114,114 @@ class LatentSelfThink:
         payload["messages"] = messages
         return payload
 
-    @torch.no_grad()
-    def run_one(self, item: Dict) -> Dict:
-        task = item.get("task", self.cfg.task)
-        question = item["question"]
-        gold = item.get("gold")
+    def _should_run_latent(self) -> bool:
+        return bool(self.cfg.loop_decode or (self.cfg.latent_steps and self.cfg.latent_steps > 0))
 
-        latent_phase, decode_phase = self._resolve_phase_configs(task, question)
-        latent_messages = build_messages(latent_phase)
-        _, input_ids, attn = self.model.prepare_chat_input(
-            latent_messages,
-            add_generation_prompt=True,
-            enable_thinking=latent_phase.enable_thinking,
-            strip_think_tags=latent_phase.strip_think_tags,
-        )
+    def _prepare_batch_entries(self, items: List[Dict]) -> List[Dict]:
+        entries: List[Dict] = []
+        for item in items:
+            task = item.get("task", self.cfg.task)
+            question = item["question"]
+            gold = item.get("gold")
+
+            latent_phase, decode_phase = self._resolve_phase_configs(task, question)
+            latent_messages = build_messages(latent_phase)
+            decode_messages = build_messages(decode_phase)
+            if self.cfg.decoding_new_message:
+                decode_messages = [{"role": "user", "content": "\n"}]
+
+            entries.append(
+                {
+                    "item": item,
+                    "task": task,
+                    "question": question,
+                    "gold": gold,
+                    "latent_phase": latent_phase,
+                    "decode_phase": decode_phase,
+                    "latent_messages": latent_messages,
+                    "decode_messages": decode_messages,
+                }
+            )
+        return entries
+
+    def _finalize_batch_results(
+        self,
+        entries: List[Dict],
+        texts: List[str],
+        per_sample_new: torch.Tensor,
+        *,
+        latent_steps_used: int,
+        stop_p_true: bool,
+        debug_steps: List[Dict],
+        closed_latent_think_tag: bool,
+    ) -> List[Dict]:
+        results: List[Dict] = []
+        for idx, entry in enumerate(entries):
+            task = entry["task"]
+            gold = entry["gold"]
+            raw = texts[idx]
+            decoded_tokens = int(per_sample_new[idx].item())
+            extracted = extract_answer_for_task(task, raw)
+            pred = normalize_prediction_for_task(task, extracted)
+            gold_n = normalize_prediction_for_task(task, str(gold)) if gold is not None else None
+            ok = answers_match(task, pred, gold)
+
+            result = {
+                "task": task,
+                "question": entry["question"],
+                "gold": gold,
+                "prediction": pred,
+                "extracted_prediction": extracted,
+                "raw_prediction": raw,
+                "correct": ok,
+                "latent_steps": self.cfg.latent_steps,
+                "decoded_tokens": decoded_tokens,
+                "mode": "baseline" if (not self.cfg.latent_steps or self.cfg.latent_steps <= 0) else "latent",
+                "latent_steps_used": latent_steps_used,
+                "early_stopped": (latent_steps_used < self.cfg.latent_steps),
+                "early_stop_p_true": stop_p_true,
+                "latent_debug_steps": debug_steps,
+                "loop_decode": self.cfg.loop_decode,
+                "strategy_label": self.cfg.strategy_label,
+                "closed_latent_think_tag_before_decode": closed_latent_think_tag,
+                "phase_configs": {
+                    "latent": self._phase_result_payload(entry["latent_phase"], entry["latent_messages"]),
+                    "decode": self._phase_result_payload(entry["decode_phase"], entry["decode_messages"]),
+                },
+            }
+            if gold_n is not None:
+                result["gold_normalized"] = gold_n
+
+            for key in ("subject", "level", "unique_id"):
+                if key in entry["item"]:
+                    result[key] = entry["item"][key]
+            results.append(result)
+        return results
+
+    @torch.no_grad()
+    def run_batch(self, items: List[Dict]) -> List[Dict]:
+        if not items:
+            return []
+
+        if self.cfg.latent_early_stop and len(items) > 1:
+            return [self.run_one(item) for item in items]
+
+        entries = self._prepare_batch_entries(items)
 
         past = None
         latent_steps_used = 0
         stop_p_true = False
-        debug_steps = []
+        debug_steps: List[Dict] = []
+        should_run_latent = self._should_run_latent()
 
-        if self.cfg.loop_decode or (self.cfg.latent_steps and self.cfg.latent_steps > 0):
+        if should_run_latent:
+            latent_phase = entries[0]["latent_phase"]
+            _, input_ids, attn = self.model.prepare_chat_batch(
+                [entry["latent_messages"] for entry in entries],
+                add_generation_prompt=True,
+                enable_thinking=latent_phase.enable_thinking,
+                strip_think_tags=latent_phase.strip_think_tags,
+            )
             past, stop_p_true, latent_steps_used, debug_steps = self.model.generate_latent_batch(
                 input_ids=input_ids,
                 attention_mask=attn,
@@ -152,17 +239,14 @@ class LatentSelfThink:
         if (
             self.cfg.close_latent_think_tag_before_decode
             and past is not None
-            and latent_phase.enable_thinking is not False
+            and entries[0]["latent_phase"].enable_thinking is not False
         ):
             past = self.model.append_text_to_past("</think>", past)
             closed_latent_think_tag = True
 
-        decode_messages = build_messages(decode_phase)
-        if self.cfg.decoding_new_message:
-            decode_messages = [{"role": "user", "content": "\n"}]
-
-        _, dec_ids, dec_attn = self.model.prepare_chat_input(
-            decode_messages,
+        decode_phase = entries[0]["decode_phase"]
+        _, dec_ids, dec_attn = self.model.prepare_chat_batch(
+            [entry["decode_messages"] for entry in entries],
             add_generation_prompt=True,
             enable_thinking=decode_phase.enable_thinking,
             strip_think_tags=decode_phase.strip_think_tags,
@@ -177,41 +261,16 @@ class LatentSelfThink:
             past_key_values=past,
         )
 
-        decoded_tokens = int(per_sample_new[0])
+        return self._finalize_batch_results(
+            entries,
+            texts,
+            per_sample_new,
+            latent_steps_used=latent_steps_used,
+            stop_p_true=stop_p_true,
+            debug_steps=debug_steps,
+            closed_latent_think_tag=closed_latent_think_tag,
+        )
 
-        raw = texts[0]
-        extracted = extract_answer_for_task(task, raw)
-        pred = normalize_prediction_for_task(task, extracted)
-        gold_n = normalize_prediction_for_task(task, str(gold)) if gold is not None else None
-        ok = answers_match(task, pred, gold)
-
-        result = {
-            "task": task,
-            "question": question,
-            "gold": gold,
-            "prediction": pred,
-            "extracted_prediction": extracted,
-            "raw_prediction": raw,
-            "correct": ok,
-            "latent_steps": self.cfg.latent_steps,
-            "decoded_tokens": decoded_tokens,
-            "mode": "baseline" if (not self.cfg.latent_steps or self.cfg.latent_steps <= 0) else "latent",
-            "latent_steps_used": latent_steps_used,
-            "early_stopped": (latent_steps_used < self.cfg.latent_steps),
-            "early_stop_p_true": stop_p_true,
-            "latent_debug_steps": debug_steps,
-            "loop_decode": self.cfg.loop_decode,
-            "strategy_label": self.cfg.strategy_label,
-            "closed_latent_think_tag_before_decode": closed_latent_think_tag,
-            "phase_configs": {
-                "latent": self._phase_result_payload(latent_phase, latent_messages),
-                "decode": self._phase_result_payload(decode_phase, decode_messages),
-            },
-        }
-        if gold_n is not None:
-            result["gold_normalized"] = gold_n
-
-        for key in ("subject", "level", "unique_id"):
-            if key in item:
-                result[key] = item[key]
-        return result
+    @torch.no_grad()
+    def run_one(self, item: Dict) -> Dict:
+        return self.run_batch([item])[0]

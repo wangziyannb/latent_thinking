@@ -2,14 +2,27 @@ import argparse
 import datetime
 import json
 import os
+import sys
 import time
+from pathlib import Path
 
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from data import canonical_task_name, load_task, task_label
 from methods.latent_self_think import LatentSelfThink, RunConfig
 from models import ModelWrapper
 from utils import auto_device, set_seed
+
+
+def _effective_batch_size(args) -> int:
+    requested = max(int(args.batch_size or 1), 1)
+    if args.latent_early_stop:
+        return 1
+    return requested
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--max_samples", type=int, default=2000)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--attn_implementation", type=str, default="auto", choices=("auto", "eager", "sdpa", "flash_attention_2"))
+    p.add_argument("--disable_cudnn_sdp", action="store_true")
 
     p.add_argument("--latent_steps", type=int, default=40)
     p.add_argument("--latent_space_realign", action="store_true")
@@ -93,20 +109,34 @@ def main():
     set_seed(args.seed)
     device = auto_device(args.device)
 
-    model = ModelWrapper(args.model_name, device, latent_space_realign=args.latent_space_realign)
+    model = ModelWrapper(
+        args.model_name,
+        device,
+        latent_space_realign=args.latent_space_realign,
+        attn_implementation=args.attn_implementation,
+        disable_cudnn_sdp=args.disable_cudnn_sdp,
+    )
     runner = LatentSelfThink(model, build_run_config(args, task))
 
     items = load_task(task=task, split=args.split, max_samples=args.max_samples)
+    effective_batch_size = _effective_batch_size(args)
+    if args.latent_early_stop and args.batch_size > 1:
+        print("latent_early_stop is enabled; forcing batch_size=1 for correctness.")
 
     preds = []
     correct = 0
     decoded_total = 0
     t0 = time.perf_counter()
-    for it in tqdm(items, desc=task_label(task)):
-        out = runner.run_one(it)
-        preds.append(out)
-        correct += 1 if out.get("correct") else 0
-        decoded_total += int(out.get("decoded_tokens", 0))
+    progress = tqdm(total=len(items), desc=task_label(task))
+    for start in range(0, len(items), effective_batch_size):
+        batch_items = items[start:start + effective_batch_size]
+        outs = runner.run_batch(batch_items)
+        preds.extend(outs)
+        for out in outs:
+            correct += 1 if out.get("correct") else 0
+            decoded_total += int(out.get("decoded_tokens", 0))
+        progress.update(len(batch_items))
+    progress.close()
     elapsed = time.perf_counter() - t0
 
     acc = correct / len(preds) if preds else 0.0
@@ -135,6 +165,10 @@ def main():
             "split": args.split,
             "world_size": 1,
             "max_samples_per_rank": args.max_samples,
+            "batch_size_requested": args.batch_size,
+            "batch_size_effective": effective_batch_size,
+            "attn_implementation": args.attn_implementation,
+            "disable_cudnn_sdp": args.disable_cudnn_sdp,
             "latent_steps": args.latent_steps,
             "latent_space_realign": args.latent_space_realign,
             "max_new_tokens": args.max_new_tokens,
